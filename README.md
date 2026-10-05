@@ -21,6 +21,7 @@ The workflow progresses from raw COCO annotations to a tuned transfer-learning U
 - Train a U-Net with a **frozen pretrained EfficientNetB0 encoder**
 - **Fine-tune** the top encoder layers and tune loss weights and the prediction threshold
 - Evaluate with the **Dice coefficient** and compare all approaches
+- - Build a **Kaggle submission pipeline** at higher resolution (1024 × 1024) that splits the semantic mask into **per-filament instances** and exports them as RLE
 
 ------
 
@@ -29,6 +30,7 @@ The workflow progresses from raw COCO annotations to a tuned transfer-learning U
 - **Source:** Kaggle competition `filament-segmentation-2026`
 - **Images:** full-disk H-alpha solar images, **2048 × 2048** px (707 unique image files in the training folder)
 - **Annotations:** COCO-format JSON (`images`, `annotations`, `categories`), with a polygon `segmentation`, `bbox`, `area` and a `spine` line for every filament
+- **Test set:** 180 unlabeled images; the submission requires **one RLE-encoded mask per filament** (`filament_id`, `segmentation_rle`)
 - **Target:** binary mask (1 = filament, 0 = background)
 
 ## Data Characteristics
@@ -83,6 +85,31 @@ Shared across all notebooks and `Final Model.py`
 - **Training:** 20 epochs; the best checkpoint is saved as `best_filament_model.keras`
 - **Inference:** sigmoid output thresholded at **0.45**
 
+## 5) Kaggle Submission
+`submission/submission.ipynb`
+
+The submission notebook uses the same overall idea but with a different mindset: instead of only maximizing a semantic mask, it produces **individual filament instances**, which is what the competition evaluates.
+
+| Aspect | Research models (`models/`, `Final Model.py`) | Submission (`submission/`) |
+|---|---|---|
+| Input size | 512 × 512 | **1024 × 1024** |
+| Train / val split | 75 / 25 | 80 / 20 |
+| Skip connections | 4 (`block2a`–`block6a`) | 5 (adds `top_activation`) |
+| Decoder | 3 blocks (256 / 128 / 64), 2 convs each | 4 blocks (**512** / 256 / 128 / 64), **3 convs** each |
+| Learning rate | 1e-4 | 2e-4 (`ReduceLROnPlateau`, min 1e-6) |
+| Callbacks | `ReduceLROnPlateau`, `ModelCheckpoint` | + **`EarlyStopping`** (restore best weights) |
+| Output | Binary mask | **Instance masks** in RLE |
+
+**Inference & post-processing**
+1. Resize each test image to 1024 × 1024 and predict the probability map
+2. Resize the probability map back to the original resolution
+3. Threshold at **0.45**
+4. Split the mask into instances with `cv2.connectedComponentsWithStats` (8-connectivity)
+5. Discard components smaller than **50 pixels**
+6. Encode each instance as RLE with `pycocotools` and save `submission.csv`
+
+The final file contains **1,705 filament instances** predicted over the 180 test images.
+
 ------
 
 # Project Structure
@@ -102,6 +129,9 @@ Solar-Filament-Segmentation/
 │   ├── Base CNN Model.ipynb     # U-Net from scratch
 │   ├── Transform Model.ipynb    # Frozen EfficientNetB0 encoder
 │   └── Fine_Tuning Model.ipynb  # Partially unfrozen encoder
+├── submission/
+│   ├── submission.ipynb         # 1024 px model + instance extraction + RLE export
+│   └── submission.csv           # Final Kaggle submission file
 └── Final Model.py               # Final training + evaluation script
 ```
 
@@ -140,6 +170,9 @@ python "Final Model.py"
 ```
 This builds the EfficientNetB0 U-Net, trains it for 20 epochs, plots the loss and Dice curves, and prints the final Dice score on a random validation sample.
 
+## 7) Generate the Kaggle submission
+Run `submission/submission.ipynb` end to end. It trains the 1024 × 1024 model, predicts the test set, and writes `submission.csv`.
+
 ------
 
 # Results Summary
@@ -151,6 +184,14 @@ This builds the EfficientNetB0 U-Net, trains it for 20 epochs, plots the loss an
 | **EfficientNetB0 (fine-tuned) — Final** | **0.662** | **68.34 (200 val. images)** | 20 |
 
 > The thresholded Dice scores were computed on random validation subsets of different sizes, so they are indicative rather than strictly comparable. The Keras `val_dice_coef` column uses the full validation set and is the fairer comparison.
+
+### Submission Model (1024 × 1024)
+
+| Model | Best Val Dice (Keras metric) | Best Epoch | Test instances |
+|---|---|---|---|
+| EfficientNetB0 U-Net, 1024 px, deeper decoder | **0.688** | 14 / 20 | 1,705 |
+
+> This model uses an 80 / 20 split, so its validation Dice is not strictly comparable to the table above. Validation Dice is a pixel-wise semantic metric, while the competition scores individual filaments.
 
 <!-- 📷 FIGURE: training curves -->
 <p align="center">
@@ -169,6 +210,8 @@ Many configurations were tried during development, and the results varied notice
 - **Learning rate:** a lower learning rate caused underfitting; `1e-4` with `ReduceLROnPlateau` worked best
 - **Input scaling:** raw 0–255 inputs (the EfficientNet default) were compared with 0–1 normalization
 - **Prediction threshold:** several thresholds were tested and **0.45** gave the best Dice
+- **Input resolution:** moving from 512 to 1024 px (with a deeper decoder) raised the best validation Dice from about 0.66 to 0.69
+- **Instance extraction:** connected components with a minimum area of 50 px were used to turn the semantic mask into per-filament predictions
 
 The final model is the configuration in `Final Model.py`.
 
@@ -180,15 +223,16 @@ The final model is the configuration in `Final Model.py`.
 - Fine-tuning only the top encoder layers gave the best balance between adapting to solar images and keeping the pretrained features
 - Training Dice kept rising to about 0.78 while validation Dice plateaued around 0.66, so the models show some **overfitting**
 - Tuning the output threshold gave a small but real gain at inference time
+- Higher input resolution helps thin structures like filaments, at a large cost in training time (~410 s per epoch at 1024 px)
 
 ------
 
 # Limitations
 - The annotation file lists some frames more than once under different IDs, and the split is made per entry, so the same frame can appear in both train and validation. This may make validation scores optimistic
-- Images were downscaled from 2048 × 2048 to 512 × 512, which can erase thin filaments
+- Images were downscaled from 2048 × 2048 (to 512 × 512 in the research models, 1024 × 1024 in the submission), which can erase thin filaments
 - No data augmentation was used
 - Thresholded Dice was measured on random validation subsets of different sizes, and the from-scratch U-Net has no thresholded score
-- No separate held-out test evaluation is documented, only validation results
+- Local results are validation-only; the test set has no public labels, and instances are extracted with connected components, so touching filaments are merged into one
 - Only EfficientNetB0 was explored as an encoder
 
 ------
@@ -208,6 +252,8 @@ The final model is the configuration in `Final Model.py`.
 - `scikit-learn`
 - `matplotlib` / `plotly`
 - `kagglehub`
+- `tqdm`
+- `pycocotools`
 
 ------
 
